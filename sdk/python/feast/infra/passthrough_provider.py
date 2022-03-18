@@ -27,6 +27,28 @@ from feast.utils import make_tzaware
 DEFAULT_BATCH_SIZE = 10_000
 
 
+import multiprocessing as mp
+from functools import partial
+
+
+def chunks(lst, n):
+    """Yield successive n-sized chunks from lst."""
+    for i in range(0, len(lst), n):
+        yield lst[i : i + n]
+
+
+def _online_write_batch(provider, join_keys, feature_view, table):
+    with tqdm(total=table.num_rows) as pbar:
+        for batch in table.to_batches(DEFAULT_BATCH_SIZE):
+            rows_to_write = _convert_arrow_to_proto(batch, feature_view, join_keys)
+            provider.online_write_batch(
+                provider.repo_config,
+                feature_view,
+                rows_to_write,
+                lambda x: pbar.update(x),
+            )
+
+
 class PassthroughProvider(Provider):
     """
     The Passthrough provider delegates all operations to the underlying online and offline stores.
@@ -157,16 +179,20 @@ class PassthroughProvider(Provider):
             table = _run_field_mapping(table, feature_view.batch_source.field_mapping)
 
         join_keys = {entity.join_key: entity.value_type for entity in entities}
+#        return _online_write_batch(self, join_keys, feature_view, table)
 
-        with tqdm_builder(table.num_rows) as pbar:
-            for batch in table.to_batches(DEFAULT_BATCH_SIZE):
-                rows_to_write = _convert_arrow_to_proto(batch, feature_view, join_keys)
-                self.online_write_batch(
-                    self.repo_config,
-                    feature_view,
-                    rows_to_write,
-                    lambda x: pbar.update(x),
+        parallelism = mp.cpu_count() * 4
+        batch_size = len(table) // parallelism
+        with mp.Pool(parallelism) as pool:
+            models = list(
+                tqdm(
+                    pool.imap(
+                        partial(_online_write_batch, self, join_keys, feature_view),
+                        chunks(table, n=batch_size),
+                    ),
+                    total=parallelism,
                 )
+            )
 
     def get_historical_features(
         self,
